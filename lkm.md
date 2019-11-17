@@ -2,11 +2,12 @@
 
 ##### 命令
 
-- ismod：查看已经加载的内核模块， 通过读取文件/proc/modules来获取其信息 
+- lsmod：查看已经加载的内核模块， 通过读取文件/proc/modules来获取其信息 
 - 加载内核模块：
-  -  modprobe 加载模块名字，自己去找依赖的模块， 它首先在文件/etc/modprobe.conf中查找该字符串 ， 接下来，modprobe查看文件 /lib/modules/version/modules.dep ，以查看是否必须加载其他模块才能加载所请求的模块。 该文件由depmod -a创建，包含模块依赖项 
-  -  insmod  直接加载ko文件，需要自己提前添加依赖模块
-  -  nsmod要求你传递完整的路径名并以正确的顺序插入模块，而modprobe只取名字，没有任何扩展名，并通过解析/ lib找出它需要知道的所有内容/modules/version/modules.dep 。 
+  - 如果模块初始化函数返回负值会加载失败提示权限不够
+  - modprobe 加载模块名字，自己去找依赖的模块， 它首先在文件/etc/modprobe.conf中查找该字符串 ， 接下来，modprobe查看文件 /lib/modules/version/modules.dep ，以查看是否必须加载其他模块才能加载所请求的模块。 该文件由depmod -a创建，包含模块依赖项 
+  - insmod  直接加载ko文件，需要自己提前添加依赖模块
+  - insmod要求你传递完整的路径名并以正确的顺序插入模块，而modprobe只取名字，没有任何扩展名，并通过解析/ lib找出它需要知道的所有内容/modules/version/modules.dep 。 
 -  modinfo：查看内核模块信息
 -  rmmod：删除内核模块
 -  dmesg ：查看打印信息
@@ -256,5 +257,257 @@ all:
 
 clean:
     make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+```
+
+##### 设备驱动程序
+
+​		 一类模块是设备驱动程序，它为电视卡或串行端口等硬件提供功能。 在unix上，每个硬件都由位于/ dev中的文件表示，该文件命名为设备文件 ，该文件提供与硬件通信的方法。 设备驱动程序代表用户程序提供通信。 
+
+​		ls -l /dev   可以看到所以的设备驱动，有两个设备编号： 设备的主要编号、从编号。 主要编号告诉您使用哪个驱动程序访问硬件。 为每个驱动程序分配一个唯一的主编号; 具有相同主要编号的所有设备文件由同一驱动程序控制， 驱动程序使从编号来区分它控制的各种硬件。
+
+###### 设备驱动的种类
+
+​		 块设备：块设备具有请求缓冲区，因此它们可以选择响应请求的最佳顺序。 这在存储设备的情况下是重要的，其中读取或写入彼此接近的扇区更快，而不是那些相距更远的扇区 
+
+​		字符设备： 能接受块中的输入和返回输出（其大小可以根据设备而变化），而字符设备允许使用它们喜欢的尽可能多的字节 
+
+​		使用ls -l 查看第一个字母是C 就是字符设备，是B就是是块设备
+
+​		 如果要查看已分配的主要编号，可以查看 / proc / devices 
+
+###### 设备驱动的安装
+
+​	 设备文件都是由mknod命令创建的。 要创建一个名为“coffee”且主要/次要编号为12和2的新char设备，只需执行mknod / dev / coffee c 12 2即可 。 您不必将设备文件放入/ dev ，但它是按惯例完成的。 Linus将他的设备文件放在/ dev中 ，所以你应该这样做。 但是，在创建用于测试目的的设备文件时，可以将它放在编译内核模块的工作目录中。 完成编写设备驱动程序后，请务必将其放在正确的位置 
+
+###### 字符设备驱动
+
+​		file_operations 结构体：/fs.h
+
+```c
+struct file_operations {
+    struct module *owner;
+     loff_t(*llseek) (struct file *, loff_t, int);
+     ssize_t(*read) (struct file *, char __user *, size_t, loff_t *);
+     ssize_t(*aio_read) (struct kiocb *, char __user *, size_t, loff_t);
+     ssize_t(*write) (struct file *, const char __user *, size_t, loff_t *);
+     ssize_t(*aio_write) (struct kiocb *, const char __user *, size_t,
+                  loff_t);
+    int (*readdir) (struct file *, void *, filldir_t);
+    unsigned int (*poll) (struct file *, struct poll_table_struct *);
+    int (*ioctl) (struct inode *, struct file *, unsigned int,
+              unsigned long);
+    int (*mmap) (struct file *, struct vm_area_struct *);
+    int (*open) (struct inode *, struct file *);
+    int (*flush) (struct file *);
+    int (*release) (struct inode *, struct file *);
+    int (*fsync) (struct file *, struct dentry *, int datasync);
+    int (*aio_fsync) (struct kiocb *, int datasync);
+    int (*fasync) (int, struct file *, int);
+    int (*lock) (struct file *, int, struct file_lock *);
+     ssize_t(*readv) (struct file *, const struct iovec *, unsigned long,
+              loff_t *);
+     ssize_t(*writev) (struct file *, const struct iovec *, unsigned long,
+               loff_t *);
+     ssize_t(*sendfile) (struct file *, loff_t *, size_t, read_actor_t,
+                 void __user *);
+     ssize_t(*sendpage) (struct file *, struct page *, int, size_t,
+                 loff_t *, int);
+    unsigned long (*get_unmapped_area) (struct file *, unsigned long,
+                        unsigned long, unsigned long,
+                        unsigned long);
+};
+```
+
+注册设备
+
+```c
+/*
+*    major 主设备号
+*    name  设备名字
+*    fops  设备驱动函数
+*/
+int register_chrdev(unsigned int major, const char *name, struct file_operations *fops);
+```
+
+ 		将主要编号0传递给register_chrdev ，则返回值将是动态分配的主编号。 缺点是您无法提前制作设备文件，因为您不知道主要编号是什么。 有几种方法可以做到这一点。 首先，驱动程序本身可以打印新分配的号码，我们可以手动制作设备文件。 其次，新注册的设备将在/ proc / devices中有一个条目，我们可以手工制作设备文件，也可以编写shell脚本来读取文件并制作设备文件。 第三种方法是我们可以让我们的驱动程序在成功注册后使用mknod系统调用来生成设备文件，并在调用cleanup_module期间使用rm。 
+
+###### 取消设备
+
+​		 当root感觉它时，我们不能允许内核模块被rmmod编辑。 如果一个进程打开了设备文件，然后我们删除了内核模块，那么使用该文件会导致调用以前使用相应函数（读/写）的内存位置。 如果我们很幸运，那里没有加载其他代码，我们会收到一条丑陋的错误消息。 如果我们运气不好，另一个内核模块被加载到同一个位置，这意味着跳转到内核中另一个函数的中间。 这样的结果是不可能预测的，但它们不是非常积极的。 
+
+​		 通常，当您不想允许某些内容时，您将从应该执行此操作的函数返回错误代码（负数）。 使用cleanup_module是不可能的，因为它是一个void函数。 但是，有一个计数器可以跟踪使用模块的进程数量。 通过查看/ proc / modules的第3个字段，您可以看到它的价值。 如果此数字不为零，则rmmod将失败。 请注意，您不必在cleanup_module中检查计数器，因为将通过linux / module.c中定义的系统调用sys_delete_module为您执行检查。 你不应该直接使用这个计数器，但linux / module.h中定义了一些函数，可以增加，减少和显示这个计数器： 
+
+```c
+unregister_chrdev(Major, DEVICE_NAME);
+try_module_get（THIS_MODULE） //增加使用次数。
+module_put（THIS_MODULE）     //减少使用次数。
+```
+
+示例
+
+```c
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <asm/uaccess.h>    /* for put_user */
+
+/*  
+ *  Prototypes - this would normally go in a .h file
+ */
+int init_module(void);
+void cleanup_module(void);
+static int device_open(struct inode *, struct file *);
+static int device_release(struct inode *, struct file *);
+static ssize_t device_read(struct file *, char *, size_t, loff_t *);
+static ssize_t device_write(struct file *, const char *, size_t, loff_t *);
+
+#define SUCCESS 0
+#define DEVICE_NAME "chardev"   /* Dev name as it appears in /proc/devices   */
+#define BUF_LEN 80      /* Max length of the message from the device */
+
+/* 
+ * Global variables are declared as static, so are global within the file. 
+ */
+
+static int Major;       /* Major number assigned to our device driver */
+static int Device_Open = 0; /* Is device open?  
+                 * Used to prevent multiple access to device */
+static char msg[BUF_LEN];   /* The msg the device will give when asked */
+static char *msg_Ptr;
+
+static struct file_operations fops = {
+    .read = device_read,
+    .write = device_write,
+    .open = device_open,
+    .release = device_release
+};
+
+/*
+ * This function is called when the module is loaded
+ */
+int init_module(void)
+{
+        Major = register_chrdev(0, DEVICE_NAME, &fops);
+
+    if (Major < 0) {
+      printk(KERN_ALERT "Registering char device failed with %d\n", Major);
+      return Major;
+    }
+
+    printk(KERN_INFO "I was assigned major number %d. To talk to\n", Major);
+    printk(KERN_INFO "the driver, create a dev file with\n");
+    printk(KERN_INFO "'mknod /dev/%s c %d 0'.\n", DEVICE_NAME, Major);
+    printk(KERN_INFO "Try various minor numbers. Try to cat and echo to\n");
+    printk(KERN_INFO "the device file.\n");
+    printk(KERN_INFO "Remove the device file and module when done.\n");
+
+    return SUCCESS;
+}
+
+/*
+ * This function is called when the module is unloaded
+ */
+void cleanup_module(void)
+{
+    /* 
+     * Unregister the device 
+     */
+    int ret = unregister_chrdev(Major, DEVICE_NAME);
+    if (ret < 0)
+        printk(KERN_ALERT "Error in unregister_chrdev: %d\n", ret);
+}
+
+/*
+ * Methods
+ */
+
+/* 
+ * Called when a process tries to open the device file, like
+ * "cat /dev/mycharfile"
+ */
+static int device_open(struct inode *inode, struct file *file)
+{
+    static int counter = 0;
+
+    if (Device_Open)
+        return -EBUSY;
+
+    Device_Open++;
+    sprintf(msg, "I already told you %d times Hello world!\n", counter++);
+    msg_Ptr = msg;
+    try_module_get(THIS_MODULE);
+
+    return SUCCESS;
+}
+
+/* 
+ * Called when a process closes the device file.
+ */
+static int device_release(struct inode *inode, struct file *file)
+{
+    Device_Open--;      /* We're now ready for our next caller */
+
+    /* 
+     * Decrement the usage count, or else once you opened the file, you'll
+     * never get get rid of the module. 
+     */
+    module_put(THIS_MODULE);
+
+    return 0;
+}
+
+/* 
+ * Called when a process, which already opened the dev file, attempts to
+ * read from it.
+ */
+static ssize_t device_read(struct file *filp,   /* see include/linux/fs.h   */
+               char *buffer,    /* buffer to fill with data */
+               size_t length,   /* length of the buffer     */
+               loff_t * offset)
+{
+    /*
+     * Number of bytes actually written to the buffer 
+     */
+    int bytes_read = 0;
+
+    /*
+     * If we're at the end of the message, 
+     * return 0 signifying end of file 
+     */
+    if (*msg_Ptr == 0)
+        return 0;
+
+    /* 
+     * Actually put the data into the buffer 
+     */
+    while (length && *msg_Ptr) {
+
+        /* 
+         * The buffer is in the user data segment, not the kernel 
+         * segment so "*" assignment won't work.  We have to use 
+         * put_user which copies data from the kernel data segment to
+         * the user data segment. 
+         */
+        put_user(*(msg_Ptr++), buffer++);
+
+        length--;
+        bytes_read++;
+    }
+
+    /* 
+     * Most read functions return the number of bytes put into the buffer
+     */
+    return bytes_read;
+}
+
+/*  
+ * Called when a process writes to dev file: echo "hi" > /dev/hello 
+ */
+static ssize_t
+device_write(struct file *filp, const char *buff, size_t len, loff_t * off)
+{
+    printk(KERN_ALERT "Sorry, this operation isn't supported.\n");
+    return -EINVAL;
+}	
 ```
 
