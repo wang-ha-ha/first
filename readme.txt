@@ -18,3 +18,5 @@ add commot 测试没有成功，
 这次成功了，不能使用git commit readm.txt -m  这样好像会直接把工作区没有提交到暂存区里面的部分一起提交上去。
 
 devtest
+
+开发客户新功能
