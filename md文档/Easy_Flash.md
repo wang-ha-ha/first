@@ -179,3 +179,232 @@ struct sector_cache_node sector_cache_table[EF_SECTOR_CACHE_TABLE_SIZE] = { 0 };
 #endif /* EF_ENV_USING_CACHE */
 ```
 
+##### 扇区的遍历
+
+###### 		sector_iterator
+
+​		主要是 sector_iterator 这个函数去遍历，通过传入不同的回调函数做不同的处理
+
+```c
+/*
+*     sector 传入扇区操作结构体，需要提前申请好内存
+*	  status 对应需要执行操作的状态
+*	  arg1、arg2 给回调函数的参数
+*	  callback 回调函数
+*     traversal 是否需要全部遍历
+*/
+
+static void sector_iterator(sector_meta_data_t sector, sector_store_status_t status, void *arg1, void *arg2,
+        bool (*callback)(sector_meta_data_t sector, void *arg1, void *arg2), bool traversal_env) {
+    uint32_t sec_addr;
+
+    /* search all sectors */
+    sector->addr = FAILED_ADDR;
+    while ((sec_addr = get_next_sector_addr(sector)) != FAILED_ADDR) {
+        //读扇区头部信息
+        read_sector_meta_data(sec_addr, sector, false);
+        if (status == SECTOR_STORE_UNUSED || status == sector->status.store) {
+            if (traversal_env) {
+                read_sector_meta_data(sec_addr, sector, traversal_env);
+            }
+            /* iterator is interrupted when callback return true */
+            if (callback && callback(sector, arg1, arg2)) {
+                return;
+            }
+        }
+    }
+}
+```
+
+​		sector_iterator 回调函数
+
+```c
+/*
+*   sector_iterator 检测扇区头部的回调函数
+*/
+static bool check_sec_hdr_cb(sector_meta_data_t sector, void *arg1, void *arg2)
+{
+    if (!sector->check_ok) {
+        size_t *failed_count = arg1;
+
+        EF_INFO("Warning: Sector header check failed. Format this sector (0x%08x).\n", sector->addr);
+        (*failed_count) ++;
+        format_sector(sector->addr, SECTOR_NOT_COMBINED);
+    }
+
+    return false;
+}
+```
+
+```c
+/*
+*   sector_iterator 统计没有使用的扇区数量
+*/
+static bool sector_statistics_cb(sector_meta_data_t sector, void *arg1, void *arg2)
+{
+    size_t *empty_sector = arg1, *using_sector = arg2;
+
+    if (sector->check_ok && sector->status.store == SECTOR_STORE_EMPTY) {
+        (*empty_sector)++;
+    } else if (sector->check_ok && sector->status.store == SECTOR_STORE_USING) {
+        (*using_sector)++;
+    }
+
+    return false;
+}
+```
+
+```c
+/*
+*   sector_iterator 检测到有剩余空间的扇区
+*/
+static bool alloc_env_cb(sector_meta_data_t sector, void *arg1, void *arg2)
+{
+    size_t *env_size = arg1;
+    uint32_t *empty_env = arg2;
+
+    /* 1. sector has space
+     * 2. the NO dirty sector
+     * 3. the dirty sector only when the gc_request is false */
+    if (sector->check_ok && sector->remain > *env_size
+            && ((sector->status.dirty == SECTOR_DIRTY_FALSE)
+                    || (sector->status.dirty == SECTOR_DIRTY_TRUE && !gc_request))) {
+        *empty_env = sector->empty_env;
+        return true;
+    }
+
+    return false;
+}
+```
+
+```c
+static bool gc_check_cb(sector_meta_data_t sector, void *arg1, void *arg2)
+{
+    size_t *empty_sec = arg1;
+
+    if (sector->check_ok) {
+        *empty_sec = *empty_sec + 1;
+    }
+
+    return false;
+
+}
+
+static bool do_gc(sector_meta_data_t sector, void *arg1, void *arg2)
+{
+    struct env_meta_data env;
+
+    if (sector->check_ok && (sector->status.dirty == SECTOR_DIRTY_TRUE || sector->status.dirty == SECTOR_DIRTY_GC)) {
+        uint8_t status_table[DIRTY_STATUS_TABLE_SIZE];
+        /* change the sector status to GC */
+        write_status(sector->addr + SECTOR_DIRTY_OFFSET, status_table, SECTOR_DIRTY_STATUS_NUM, SECTOR_DIRTY_GC);
+        /* search all ENV */
+        env.addr.start = FAILED_ADDR;
+        while ((env.addr.start = get_next_env_addr(sector, &env)) != FAILED_ADDR) {
+            read_env(&env);
+            if (env.crc_is_ok && (env.status == ENV_WRITE || env.status == ENV_PRE_DELETE)) {
+                /* move the ENV to new space */
+                if (move_env(&env) != EF_NO_ERR) {
+                    EF_DEBUG("Error: Moved the ENV (%.*s) for GC failed.\n", env.name_len, env.name);
+                }
+            }
+        }
+        format_sector(sector->addr, SECTOR_NOT_COMBINED);
+        EF_DEBUG("Collect a sector @0x%08X\n", sector->addr);
+    }
+
+    return false;
+}
+```
+
+
+
+###### 		get_next_sector_addr
+
+​		拿到下一个扇区的地址
+
+```c
+static uint32_t get_next_sector_addr(sector_meta_data_t pre_sec)
+{
+    uint32_t next_addr;
+
+    if (pre_sec->addr == FAILED_ADDR) {
+        return env_start_addr;
+    } else {
+        /* check ENV sector combined */
+        if (pre_sec->combined == SECTOR_NOT_COMBINED) {
+            next_addr = pre_sec->addr + SECTOR_SIZE;
+        } else {
+            next_addr = pre_sec->addr + pre_sec->combined * SECTOR_SIZE;
+        }
+        /* check range */
+        if (next_addr < env_start_addr + ENV_AREA_SIZE) {
+            return next_addr;
+        } else {
+            /* no sector */
+            return FAILED_ADDR;
+        }
+    }
+}
+```
+
+###### 	format_sector
+
+​		格式化扇区
+
+```c
+static EfErrCode format_sector(uint32_t addr, uint32_t combined_value)
+{
+    EfErrCode result = EF_NO_ERR;
+    struct sector_hdr_data sec_hdr;
+
+    EF_ASSERT(addr % SECTOR_SIZE == 0);
+
+    result = ef_port_erase(addr, SECTOR_SIZE);
+    if (result == EF_NO_ERR) {
+        /* initialize the header data */
+        memset(&sec_hdr, 0xFF, sizeof(struct sector_hdr_data));
+        set_status(sec_hdr.status_table.store, SECTOR_STORE_STATUS_NUM, SECTOR_STORE_EMPTY);
+        set_status(sec_hdr.status_table.dirty, SECTOR_DIRTY_STATUS_NUM, SECTOR_DIRTY_FALSE);
+        sec_hdr.magic = SECTOR_MAGIC_WORD;
+        sec_hdr.combined = combined_value;
+        sec_hdr.reserved = 0xFFFFFFFF;
+        /* save the header */
+        result = ef_port_write(addr, (uint32_t *)&sec_hdr, sizeof(struct sector_hdr_data));
+
+#ifdef EF_ENV_USING_CACHE
+        /* delete the sector cache */
+        update_sector_cache(addr, addr + SECTOR_SIZE);
+#endif /* EF_ENV_USING_CACHE */
+    }
+
+    return result;
+}
+```
+
+
+
+##### 垃圾回收函数
+
+```c
+static void gc_collect(void)
+{
+    struct sector_meta_data sector;
+    size_t empty_sec = 0;
+
+    /* GC check the empty sector number */
+    sector_iterator(&sector, SECTOR_STORE_EMPTY, &empty_sec, NULL, gc_check_cb, false);
+
+    /* do GC collect */
+    EF_DEBUG("The remain empty sector is %d, GC threshold is %d.\n", empty_sec, EF_GC_EMPTY_SEC_THRESHOLD);
+    if (empty_sec <= EF_GC_EMPTY_SEC_THRESHOLD) {
+        sector_iterator(&sector, SECTOR_STORE_UNUSED, NULL, NULL, do_gc, false);
+    }
+
+    gc_request = false;
+}
+```
+
+
+
+##### 创建、读取、修改环境变量
